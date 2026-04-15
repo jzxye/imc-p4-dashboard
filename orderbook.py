@@ -6,7 +6,7 @@ from dash import Dash, dcc, html, Input, Output
 
 ROUND = 0
 DAY = -2
-DATA_PATHNAME = "/Users/joshuaye/dev/imcprosperity4/imc-p4-dashboard/data"
+DATA_PATHNAME = f"/Users/joshuaye/dev/imcprosperity4/imc-p4-dashboard/data/round{ROUND}/"
 PRICES_FILENAME = f"prices_round_{ROUND}_day_{DAY}.csv"
 TRADES_FILENAME = f"trades_round_{ROUND}_day_{DAY}.csv"
 
@@ -27,7 +27,7 @@ price_to_volume = {
 SIZE_MAX = 30
 
 
-def build_figure(product, normalize):
+def build_figure(product, normalize, qty_range=None, ob_qty_range=None):
     prices = df_prices[df_prices['product'] == product]
     trades = df_trades[df_trades['symbol'] == product].copy().reset_index(drop=True)
 
@@ -45,8 +45,14 @@ def build_figure(product, normalize):
     plot_df = plot_df.dropna(subset=['price', 'volume'])
     plot_df['side'] = plot_df['level'].str.startswith('bid').map({True: 'bid', False: 'ask'})
 
+    if ob_qty_range is not None:
+        plot_df = plot_df[(plot_df['volume'] >= ob_qty_range[0]) & (plot_df['volume'] <= ob_qty_range[1])]
+
     trades_df = trades[['timestamp', 'price', 'quantity']].copy()
     trades_df.columns = ['timestamp', 'price', 'volume']
+
+    if qty_range is not None:
+        trades_df = trades_df[(trades_df['volume'] >= qty_range[0]) & (trades_df['volume'] <= qty_range[1])]
 
     if normalize:
         plot_df['price'] = plot_df['price'] - plot_df['timestamp'].map(timestamp_to_mid)
@@ -87,6 +93,13 @@ def build_figure(product, normalize):
 
 app = Dash(__name__)
 
+QTY_MIN = int(df_trades['quantity'].min())
+QTY_MAX = int(df_trades['quantity'].max())
+
+vol_cols = list(price_to_volume.values())
+OB_VOL_MIN = int(df_prices[vol_cols].min().min())
+OB_VOL_MAX = int(df_prices[vol_cols].max().max())
+
 app.layout = html.Div([
     html.Div([
         dcc.Dropdown(
@@ -104,6 +117,30 @@ app.layout = html.Div([
             style={'marginLeft': '20px', 'alignSelf': 'center'},
         ),
     ], style={'display': 'flex', 'alignItems': 'center', 'padding': '10px'}),
+    html.Div([
+        html.Label('Trade quantity filter:', style={'marginRight': '10px'}),
+        dcc.RangeSlider(
+            id='qty-slider',
+            min=QTY_MIN,
+            max=QTY_MAX,
+            step=1,
+            value=[QTY_MIN, QTY_MAX],
+            marks={QTY_MIN: str(QTY_MIN), QTY_MAX: str(QTY_MAX)},
+            tooltip={'placement': 'bottom', 'always_visible': True},
+        ),
+    ], style={'padding': '0 20px 10px 20px'}),
+    html.Div([
+        html.Label('Bid/ask quantity filter:', style={'marginRight': '10px'}),
+        dcc.RangeSlider(
+            id='ob-qty-slider',
+            min=OB_VOL_MIN,
+            max=OB_VOL_MAX,
+            step=1,
+            value=[OB_VOL_MIN, OB_VOL_MAX],
+            marks={OB_VOL_MIN: str(OB_VOL_MIN), OB_VOL_MAX: str(OB_VOL_MAX)},
+            tooltip={'placement': 'bottom', 'always_visible': True},
+        ),
+    ], style={'padding': '0 20px 10px 20px'}),
     dcc.Graph(id='orderbook-graph', style={'height': '80vh'}),
 ])
 
@@ -112,9 +149,11 @@ app.layout = html.Div([
     Output('orderbook-graph', 'figure'),
     Input('product-dropdown', 'value'),
     Input('normalize-toggle', 'value'),
+    Input('qty-slider', 'value'),
+    Input('ob-qty-slider', 'value'),
 )
-def update_graph(product, normalize):
-    return build_figure(product, normalize == 'normalized')
+def update_graph(product, normalize, qty_range, ob_qty_range):
+    return build_figure(product, normalize == 'normalized', qty_range, ob_qty_range)
 
 
 if __name__ == '__main__':
