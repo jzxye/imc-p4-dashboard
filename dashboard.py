@@ -4,26 +4,26 @@ from functools import lru_cache
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from dash import Dash, dcc, html, Input, Output
+from dash import Dash, dcc, html, Input, Output, State, callback_context
 from dash.exceptions import PreventUpdate
 
 DATA_DIR = "/Users/joshuaye/dev/imcprosperity4/imc-p4-dashboard/data/"
 SIZE_MAX = 30
 
 TRADER_COLORS = {
-    'Caesar':   '#1f77b4',
-    'Paris':    '#ff7f0e',
-    'Charlie':  '#2ca02c',
-    'Olivia':   '#d62728',
-    'Camilla':  '#9467bd',
-    'Pablo':    '#8c564b',
-    'Peter':    '#e377c2',
-    'Penelope': '#7f7f7f',
-    'Gary':     '#bcbd22',
-    'Gina':     '#17becf',
-    'Olga':     '#aec7e8',
+    'Mark 01':   '#e6194b',  # crimson
+    'Mark 14':   '#f58231',  # orange
+    'Mark 22':   '#ffe119',  # yellow
+    'Mark 38':   '#3cb44b',  # green
+    'Mark 49':   '#42d4f4',  # cyan
+    'Mark 55':   '#911eb4',  # purple
+    'Mark 67':   '#f032e6',  # magenta
+    'Penelope':  '#7f7f7f',
+    'Gary':      '#bcbd22',
+    'Gina':      '#17becf',
+    'Olga':      '#aec7e8',
 }
-DEFAULT_TRADER_COLOR = '#bbbbbb'
+DEFAULT_TRADER_COLOR = '#000000'
 
 PRICE_VOL_PAIRS = [
     ('bid_price_1', 'bid_volume_1'),
@@ -75,12 +75,50 @@ def load_data(round_num, day):
     return df_prices, df_trades
 
 
+def make_trader_options(traders):
+    """Checklist options with a colored dot swatch for each trader."""
+    return [
+        {
+            'label': html.Span([
+                html.Span('●', style={
+                    'color': TRADER_COLORS.get(t, DEFAULT_TRADER_COLOR),
+                    'fontSize': '18px',
+                    'marginRight': '4px',
+                    'verticalAlign': 'middle',
+                    'lineHeight': '1',
+                }),
+                t,
+            ]),
+            'value': t,
+        }
+        for t in traders
+    ]
+
+
+def make_solo_options(traders):
+    return [{'label': '— all —', 'value': '__all__'}] + [
+        {
+            'label': html.Span([
+                html.Span('●', style={
+                    'color': TRADER_COLORS.get(t, DEFAULT_TRADER_COLOR),
+                    'fontSize': '14px',
+                    'marginRight': '4px',
+                }),
+                t,
+            ]),
+            'value': t,
+        }
+        for t in traders
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Figure builder
 # ---------------------------------------------------------------------------
 
 def build_figure(df_prices, df_trades, product, normalize, qty_range,
-                 ob_qty_range, visible_traders, downsample, uirevision, x_range=None):
+                 ob_qty_range, visible_traders, trader_match, ob_display,
+                 downsample, uirevision, x_range=None):
     prices = df_prices[df_prices['product'] == product]
     trades = df_trades[df_trades['symbol'] == product].copy().reset_index(drop=True)
 
@@ -114,10 +152,17 @@ def build_figure(df_prices, df_trades, product, normalize, qty_range,
 
     has_named = trades_df['buyer'].notna().any() or trades_df['seller'].notna().any()
     if has_named and visible_traders is not None:
-        trades_df = trades_df[
-            trades_df['buyer'].isin(visible_traders) |
-            trades_df['seller'].isin(visible_traders)
-        ]
+        vt = set(visible_traders)
+        if trader_match == 'both':
+            trades_df = trades_df[
+                trades_df['buyer'].isin(vt) &
+                trades_df['seller'].isin(vt)
+            ]
+        else:
+            trades_df = trades_df[
+                trades_df['buyer'].isin(vt) |
+                trades_df['seller'].isin(vt)
+            ]
 
     # ---- Normalise prices ----
     if normalize:
@@ -138,43 +183,64 @@ def build_figure(df_prices, df_trades, product, normalize, qty_range,
         vertical_spacing=0.07,
     )
 
-    # -- Orderbook bid / ask bubbles (Scattergl = WebGL, handles 50k+ points) --
-    ob_sizeref = (2 * plot_df['volume'].max() / SIZE_MAX ** 2) if not plot_df.empty else 1
-    for side, rgba in [('bid', 'rgba(31,119,180,0.50)'), ('ask', 'rgba(214,39,40,0.50)')]:
-        sub = plot_df[plot_df['side'] == side]
-        if sub.empty:
-            continue
-        fig.add_trace(go.Scattergl(
-            x=sub['timestamp'].values,
-            y=sub['price'].values,
-            mode='markers',
-            name=side,
-            marker=dict(
-                color=rgba,
-                size=sub['volume'].values,
-                sizemode='area',
-                sizeref=ob_sizeref,
-                sizemin=3,
-                line=dict(width=0),
-            ),
-            customdata=sub['volume'].values.reshape(-1, 1),
-            hovertemplate=(
-                f'ts: %{{x}}<br>{y_label}: %{{y}}<br>vol: %{{customdata[0]}}'
-                '<extra></extra>'
-            ),
-        ), row=1, col=1)
+    # -- Orderbook: bubbles and/or best bid/ask lines --
+    if ob_display in ('bubbles', 'both'):
+        ob_sizeref = (2 * plot_df['volume'].max() / SIZE_MAX ** 2) if not plot_df.empty else 1
+        for side, rgba in [('bid', 'rgba(31,119,180,0.25)'), ('ask', 'rgba(214,39,40,0.25)')]:
+            sub = plot_df[plot_df['side'] == side]
+            if sub.empty:
+                continue
+            fig.add_trace(go.Scattergl(
+                x=sub['timestamp'].values,
+                y=sub['price'].values,
+                mode='markers',
+                name=side,
+                marker=dict(
+                    color=rgba,
+                    size=sub['volume'].values,
+                    sizemode='area',
+                    sizeref=ob_sizeref,
+                    sizemin=3,
+                    line=dict(width=0),
+                ),
+                customdata=sub['volume'].values.reshape(-1, 1),
+                hovertemplate=(
+                    f'ts: %{{x}}<br>{y_label}: %{{y}}<br>vol: %{{customdata[0]}}'
+                    '<extra></extra>'
+                ),
+            ), row=1, col=1)
+
+    if ob_display in ('lines', 'both'):
+        for price_col, color, name in [
+            ('bid_price_1', 'rgba(31,119,180,0.85)', 'best bid'),
+            ('ask_price_1', 'rgba(214,39,40,0.85)',  'best ask'),
+        ]:
+            line_df = prices[['timestamp', price_col]].dropna()
+            if normalize:
+                line_df = line_df.copy()
+                line_df[price_col] = line_df[price_col] - line_df['timestamp'].map(timestamp_to_mid)
+            fig.add_trace(go.Scattergl(
+                x=line_df['timestamp'].values,
+                y=line_df[price_col].values,
+                mode='lines',
+                name=name,
+                line=dict(color=color, width=1.5),
+                hovertemplate=f'ts: %{{x}}<br>{y_label}: %{{y}}<extra></extra>',
+            ), row=1, col=1)
 
     # -- Trade markers (Scatter — fewer points, need triangle/square symbols) --
     if not trades_df.empty:
         trade_sizeref = 2 * trades_df['quantity'].max() / SIZE_MAX ** 2
 
         if has_named:
-            # Reference: triangle-up = buyer (taker), triangle-down = seller (maker)
+            # triangle-up = buyer side, triangle-down = seller side; color = trader
             all_traders = sorted(set(
                 trades_df['buyer'].dropna().tolist() +
                 trades_df['seller'].dropna().tolist()
             ))
             for trader in all_traders:
+                if visible_traders is not None and trader not in visible_traders:
+                    continue
                 color = TRADER_COLORS.get(trader, DEFAULT_TRADER_COLOR)
                 for role, symbol, label_suffix in [
                     ('buyer',  'triangle-up',   'buy'),
@@ -192,13 +258,16 @@ def build_figure(df_prices, df_trades, product, normalize, qty_range,
                         marker=dict(
                             symbol=symbol,
                             color=color,
+                            opacity=1.0,
                             size=sub['quantity'].values,
                             sizemode='area',
                             sizeref=trade_sizeref,
                             sizemin=8,
+                            line=dict(width=1.5, color='rgba(0,0,0,0.6)'),
                         ),
-                        customdata=sub[['buyer', 'seller', 'quantity']].values,
+                        customdata=sub[['buyer', 'seller', 'quantity', 'timestamp']].values,
                         hovertemplate=(
+                            'ts: %{customdata[3]}<br>'
                             'buyer: %{customdata[0]}<br>'
                             'seller: %{customdata[1]}<br>'
                             f'{y_label}: %{{y}}<br>'
@@ -207,7 +276,7 @@ def build_figure(df_prices, df_trades, product, normalize, qty_range,
                         ),
                     ), row=1, col=1)
         else:
-            # Anonymous trades — single square trace (reference: squares = market makers)
+            # Anonymous trades — single square trace
             fig.add_trace(go.Scatter(
                 x=trades_df['timestamp'].values,
                 y=trades_df['price'].values,
@@ -216,13 +285,15 @@ def build_figure(df_prices, df_trades, product, normalize, qty_range,
                 marker=dict(
                     symbol='square',
                     color='black',
+                    opacity=1.0,
                     size=trades_df['quantity'].values,
                     sizemode='area',
                     sizeref=trade_sizeref,
                     sizemin=8,
+                    line=dict(width=1.5, color='rgba(255,255,255,0.6)'),
                 ),
-                customdata=trades_df[['quantity']].values,
-                hovertemplate=f'{y_label}: %{{y}}<br>qty: %{{customdata[0]}}<extra></extra>',
+                customdata=trades_df[['quantity', 'timestamp']].values,
+                hovertemplate=f'ts: %{{customdata[1]}}<br>{y_label}: %{{y}}<br>qty: %{{customdata[0]}}<extra></extra>',
             ), row=1, col=1)
 
     # -- PnL line (Scattergl for large series) --
@@ -244,8 +315,6 @@ def build_figure(df_prices, df_trades, product, normalize, qty_range,
     fig.update_yaxes(title_text=y_label, row=1, col=1)
     fig.update_yaxes(title_text='PnL', row=2, col=1)
     fig.update_layout(
-        # uirevision=product keeps zoom when only filters/traders change;
-        # changes on product/round/day to reset zoom
         uirevision=uirevision,
         legend=dict(orientation='v', x=1.01, y=1, tracegroupgap=2),
         margin=dict(r=160),
@@ -280,6 +349,90 @@ DOWNSAMPLE_OPTIONS = [
     {'label': '×20',   'value': 20},
     {'label': '×50',   'value': 50},
 ]
+
+GROUP_COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+
+
+def get_product_groups(products):
+    """Return {group_name: [sorted products]} detected from a product list.
+
+    Groups are found by matching all products that share the same first
+    underscore-delimited word, then using the longest common prefix as the
+    group label (e.g. GALAXY_SOUNDS, SLEEP_POD, UV_VISOR).
+    """
+    seen = set()
+    groups = {}
+    for product in products:
+        first_word = product.split('_')[0]
+        if first_word in seen:
+            continue
+        seen.add(first_word)
+        matching = sorted(p for p in products if p.startswith(first_word + '_'))
+        if len(matching) < 2:
+            continue
+        prefix = os.path.commonprefix(matching).rstrip('_')
+        groups[prefix] = matching
+    return dict(sorted(groups.items()))
+
+
+def build_group_figure(df_prices, normalize, downsample, x_range=None):
+    products = sorted(df_prices['product'].unique().tolist())
+    groups = get_product_groups(products)
+    if not groups:
+        return go.Figure()
+
+    group_names = list(groups.keys())
+    n = len(group_names)
+    ncols = 2
+    nrows = (n + ncols - 1) // ncols
+
+    fig = make_subplots(
+        rows=nrows, cols=ncols,
+        subplot_titles=group_names,
+        shared_xaxes=False,
+        vertical_spacing=0.06,
+        horizontal_spacing=0.08,
+    )
+
+    y_label = 'mid − start' if normalize else 'mid price'
+
+    for idx, gname in enumerate(group_names):
+        row = idx // ncols + 1
+        col = idx % ncols + 1
+        for pidx, product in enumerate(groups[gname]):
+            pdf = df_prices[df_prices['product'] == product]
+            if downsample > 1:
+                pdf = pdf.iloc[::downsample]
+            mid = ((pdf['bid_price_1'] + pdf['ask_price_1']) / 2)
+            if normalize:
+                first_val = mid.iloc[0] if not mid.empty else 0
+                y = (mid - first_val).values
+            else:
+                y = mid.values
+            short_name = product[len(gname) + 1:] if product.startswith(gname + '_') else product
+            fig.add_trace(go.Scattergl(
+                x=pdf['timestamp'].values,
+                y=y,
+                mode='lines',
+                name=short_name,
+                legendgroup=f'pos{pidx}',
+                legendgrouptitle_text=f'Variant {pidx + 1}' if idx == 0 else None,
+                showlegend=(idx == 0),
+                line=dict(color=GROUP_COLORS[pidx % len(GROUP_COLORS)], width=1.5),
+                hovertemplate=f'{product}<br>ts: %{{x}}<br>{y_label}: %{{y:.2f}}<extra></extra>',
+            ), row=row, col=col)
+
+    if x_range is not None:
+        fig.update_xaxes(range=x_range)
+
+    fig.update_yaxes(title_text=y_label, title_font=dict(size=10))
+    fig.update_layout(
+        height=nrows * 320,
+        legend=dict(orientation='v', x=1.01, y=1, tracegroupgap=4),
+        margin=dict(r=140, t=40, b=40),
+        uirevision='group-overview',
+    )
+    return fig
 
 app = Dash(__name__)
 
@@ -320,6 +473,18 @@ app.layout = html.Div([
                     {'label': 'Normalized', 'value': 'normalized'},
                 ],
                 value='raw', inline=True,
+            ),
+        ], style={'alignSelf': 'flex-end', 'paddingBottom': '2px'}),
+        html.Div([
+            html.Label('Order book', style={'fontSize': '12px'}),
+            dcc.RadioItems(
+                id='ob-display-radio',
+                options=[
+                    {'label': 'Bubbles', 'value': 'bubbles'},
+                    {'label': 'Lines',   'value': 'lines'},
+                    {'label': 'Both',    'value': 'both'},
+                ],
+                value='bubbles', inline=True,
             ),
         ], style={'alignSelf': 'flex-end', 'paddingBottom': '2px'}),
         html.Div([
@@ -379,25 +544,79 @@ app.layout = html.Div([
 
     # ---- Trader filter ----
     html.Div([
-        html.Label('Traders:', style={'fontSize': '12px', 'marginRight': '8px',
-                                      'alignSelf': 'center', 'whiteSpace': 'nowrap'}),
+        # Controls row: label + All/None buttons + Solo dropdown
+        html.Div([
+            html.Label('Traders:', style={
+                'fontSize': '12px', 'marginRight': '8px',
+                'alignSelf': 'center', 'whiteSpace': 'nowrap',
+            }),
+            html.Button('All', id='traders-all-btn', n_clicks=0, style={
+                'fontSize': '11px', 'padding': '2px 8px', 'cursor': 'pointer',
+                'marginRight': '4px', 'borderRadius': '3px',
+            }),
+            html.Button('None', id='traders-none-btn', n_clicks=0, style={
+                'fontSize': '11px', 'padding': '2px 8px', 'cursor': 'pointer',
+                'marginRight': '16px', 'borderRadius': '3px',
+            }),
+            html.Label('Solo:', style={
+                'fontSize': '12px', 'marginRight': '6px',
+                'alignSelf': 'center', 'whiteSpace': 'nowrap',
+            }),
+            dcc.Dropdown(
+                id='solo-trader-dropdown',
+                options=make_solo_options(_DEFAULT_TRADERS),
+                value='__all__',
+                clearable=False,
+                style={'width': '160px', 'fontSize': '12px'},
+            ),
+            html.Span('│', style={'margin': '0 12px', 'color': '#ccc'}),
+            html.Label('Match:', style={
+                'fontSize': '12px', 'marginRight': '6px',
+                'alignSelf': 'center', 'whiteSpace': 'nowrap',
+            }),
+            dcc.RadioItems(
+                id='trader-match-radio',
+                options=[
+                    {'label': 'Any party',  'value': 'any'},
+                    {'label': 'Both parties', 'value': 'both'},
+                ],
+                value='any',
+                inline=True,
+                labelStyle={'marginRight': '10px', 'fontSize': '12px'},
+            ),
+        ], style={'display': 'flex', 'alignItems': 'center', 'marginBottom': '6px'}),
+
+        # Color-coded checklist
         dcc.Checklist(
             id='trader-checklist',
-            options=[{'label': t, 'value': t} for t in _DEFAULT_TRADERS],
+            options=make_trader_options(_DEFAULT_TRADERS),
             value=_DEFAULT_TRADERS,
             inline=True,
-            labelStyle={'marginRight': '14px', 'fontSize': '13px'},
+            labelStyle={'marginRight': '16px', 'fontSize': '13px',
+                        'cursor': 'pointer', 'userSelect': 'none'},
         ),
     ], id='trader-filter-div',
-       style={'display': 'flex', 'padding': '0 20px 8px 20px', 'alignItems': 'center',
+       style={'display': 'flex', 'flexDirection': 'column',
+              'padding': '0 20px 8px 20px',
               'visibility': 'visible' if _DEFAULT_TRADERS else 'hidden'}),
 
-    # ---- Main graph (Loading spinner covers lag) ----
-    dcc.Loading(
-        id='graph-loading',
-        type='circle',
-        children=dcc.Graph(id='orderbook-graph', style={'height': '85vh'}),
-    ),
+    # ---- View tabs ----
+    dcc.Tabs(id='view-tabs', value='product', style={'padding': '0 20px'}, children=[
+        dcc.Tab(label='Product View', value='product', children=[
+            dcc.Loading(
+                id='graph-loading',
+                type='circle',
+                children=dcc.Graph(id='orderbook-graph', style={'height': '85vh'}),
+            ),
+        ]),
+        dcc.Tab(label='Group Overview', value='group', children=[
+            dcc.Loading(
+                id='group-loading',
+                type='circle',
+                children=dcc.Graph(id='group-overview-graph', style={'minHeight': '160vh'}),
+            ),
+        ]),
+    ]),
 ])
 
 
@@ -420,6 +639,8 @@ def update_days(round_num):
     Output('product-dropdown', 'value'),
     Output('trader-checklist', 'options'),
     Output('trader-checklist', 'value'),
+    Output('solo-trader-dropdown', 'options'),
+    Output('solo-trader-dropdown', 'value'),
     Output('trader-filter-div', 'style'),
     Output('qty-slider', 'min'),
     Output('qty-slider', 'max'),
@@ -438,7 +659,7 @@ def update_controls(round_num, day):
     if day is None:
         raise PreventUpdate
 
-    df_prices, df_trades = load_data(round_num, day)  # cached
+    df_prices, df_trades = load_data(round_num, day)
     products = sorted(df_prices['product'].unique().tolist())
     traders = sorted(set(
         df_trades['buyer'].dropna().tolist() + df_trades['seller'].dropna().tolist()
@@ -453,19 +674,43 @@ def update_controls(round_num, day):
     ts_max = int(df_prices['timestamp'].max())
 
     trader_style = {
-        'display': 'flex', 'padding': '0 20px 8px 20px', 'alignItems': 'center',
+        'display': 'flex', 'flexDirection': 'column',
+        'padding': '0 20px 8px 20px',
         'visibility': 'visible' if traders else 'hidden',
     }
 
     return (
         [{'label': p, 'value': p} for p in products], products[0],
-        [{'label': t, 'value': t} for t in traders], traders,
+        make_trader_options(traders), traders,
+        make_solo_options(traders), '__all__',
         trader_style,
         qty_min, qty_max, [qty_min, qty_max], {qty_min: str(qty_min), qty_max: str(qty_max)},
         ob_min, ob_max, [ob_min, ob_max], {ob_min: str(ob_min), ob_max: str(ob_max)},
-        ts_max,  # reset frame width to full range
-        0,       # reset start to 0
+        ts_max,
+        0,
     )
+
+
+@app.callback(
+    Output('trader-checklist', 'value', allow_duplicate=True),
+    Input('traders-all-btn', 'n_clicks'),
+    Input('traders-none-btn', 'n_clicks'),
+    Input('solo-trader-dropdown', 'value'),
+    State('trader-checklist', 'options'),
+    prevent_initial_call=True,
+)
+def handle_trader_shortcuts(all_clicks, none_clicks, solo, options):
+    triggered = callback_context.triggered[0]['prop_id']
+    all_values = [o['value'] for o in options]
+    if 'all-btn' in triggered:
+        return all_values
+    if 'none-btn' in triggered:
+        return []
+    if 'solo-trader' in triggered:
+        if solo and solo != '__all__':
+            return [solo]
+        return all_values
+    raise PreventUpdate
 
 
 @app.callback(
@@ -478,7 +723,7 @@ def update_controls(round_num, day):
 def update_start_max(frame_width, round_num, day):
     if day is None or frame_width is None:
         raise PreventUpdate
-    df_prices, _ = load_data(round_num, day)  # cached
+    df_prices, _ = load_data(round_num, day)
     ts_max = int(df_prices['timestamp'].max())
     new_max = max(0, ts_max - frame_width)
     return new_max, {0: '0', new_max: str(new_max)}
@@ -493,16 +738,18 @@ def update_start_max(frame_width, round_num, day):
     Input('qty-slider', 'value'),
     Input('ob-qty-slider', 'value'),
     Input('trader-checklist', 'value'),
+    Input('trader-match-radio', 'value'),
+    Input('ob-display-radio', 'value'),
     Input('downsample-dropdown', 'value'),
     Input('frame-width-slider', 'value'),
     Input('start-slider', 'value'),
 )
 def update_graph(round_num, day, product, normalize, qty_range, ob_qty_range,
-                 visible_traders, downsample, frame_width, start):
+                 visible_traders, trader_match, ob_display, downsample, frame_width, start):
     if day is None or product is None:
         raise PreventUpdate
     try:
-        df_prices, df_trades = load_data(round_num, day)  # cached
+        df_prices, df_trades = load_data(round_num, day)
         if product not in df_prices['product'].values:
             raise PreventUpdate
         x_start = start or 0
@@ -510,9 +757,43 @@ def update_graph(round_num, day, product, normalize, qty_range, ob_qty_range,
         return build_figure(
             df_prices, df_trades, product,
             normalize == 'normalized',
-            qty_range, ob_qty_range, visible_traders,
+            qty_range, ob_qty_range, visible_traders, trader_match or 'any',
+            ob_display or 'bubbles',
             downsample or 1,
             uirevision=f'{round_num}-{day}-{product}',
+            x_range=[x_start, x_end],
+        )
+    except (FileNotFoundError, KeyError):
+        raise PreventUpdate
+
+
+@app.callback(
+    Output('group-overview-graph', 'figure'),
+    Input('round-dropdown', 'value'),
+    Input('day-dropdown', 'value'),
+    Input('normalize-toggle', 'value'),
+    Input('downsample-dropdown', 'value'),
+    Input('frame-width-slider', 'value'),
+    Input('start-slider', 'value'),
+    Input('view-tabs', 'value'),
+)
+def update_group_overview(round_num, day, normalize, downsample, frame_width, start, tab):
+    if tab != 'group' or day is None:
+        raise PreventUpdate
+    try:
+        df_prices, _ = load_data(round_num, day)
+        groups = get_product_groups(sorted(df_prices['product'].unique().tolist()))
+        if not groups:
+            return go.Figure(layout=go.Layout(
+                title='No product groups detected for this round/day.',
+                height=400,
+            ))
+        x_start = start or 0
+        x_end = x_start + (frame_width or 999_900)
+        return build_group_figure(
+            df_prices,
+            normalize == 'normalized',
+            downsample or 1,
             x_range=[x_start, x_end],
         )
     except (FileNotFoundError, KeyError):
