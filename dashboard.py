@@ -75,6 +75,30 @@ def load_data(round_num, day):
     return df_prices, df_trades
 
 
+@lru_cache(maxsize=16)
+def load_merged_data(round_num):
+    """Concatenate all days for a round, offsetting timestamps by 1_000_000 per day."""
+    days = get_available_days(round_num)
+    all_prices, all_trades = [], []
+    for i, day in enumerate(days):
+        offset = i * 1_000_000
+        p, t = load_data(round_num, day)
+        p = p.copy()
+        p['timestamp'] = p['timestamp'] + offset
+        all_prices.append(p)
+        if not t.empty:
+            t = t.copy()
+            t['timestamp'] = t['timestamp'] + offset
+            all_trades.append(t)
+    df_prices = pd.concat(all_prices, ignore_index=True)
+    df_trades = (pd.concat(all_trades, ignore_index=True) if all_trades
+                 else pd.DataFrame(columns=['timestamp', 'buyer', 'seller',
+                                            'symbol', 'currency', 'price', 'quantity']))
+    # boundary_info: list of (offset, day_label) for every day transition
+    boundaries = [(i * 1_000_000, day) for i, day in enumerate(days)]
+    return df_prices, df_trades, boundaries
+
+
 def make_trader_options(traders):
     """Checklist options with a colored dot swatch for each trader."""
     return [
@@ -118,7 +142,7 @@ def make_solo_options(traders):
 
 def build_figure(df_prices, df_trades, product, normalize, qty_range,
                  ob_qty_range, visible_traders, trader_match, ob_display,
-                 downsample, uirevision, x_range=None):
+                 downsample, uirevision, x_range=None, day_boundaries=None):
     prices = df_prices[df_prices['product'] == product]
     trades = df_trades[df_trades['symbol'] == product].copy().reset_index(drop=True)
 
@@ -314,6 +338,24 @@ def build_figure(df_prices, df_trades, product, normalize, qty_range,
     fig.update_xaxes(range=[x_lo, x_hi])
     fig.update_yaxes(title_text=y_label, row=1, col=1)
     fig.update_yaxes(title_text='PnL', row=2, col=1)
+
+    if day_boundaries:
+        tick_vals, tick_text = [], []
+        for offset, day_label in day_boundaries:
+            tick_vals.append(offset + 500_000)
+            tick_text.append(f'Day {day_label}')
+            if offset > 0:
+                for row in (1, 2):
+                    fig.add_vline(
+                        x=offset, line_width=1.5,
+                        line_dash='dash', line_color='rgba(100,100,100,0.5)',
+                        row=row, col=1,
+                    )
+        fig.update_xaxes(
+            tickmode='array', tickvals=tick_vals, ticktext=tick_text,
+            tickfont=dict(size=11),
+        )
+
     fig.update_layout(
         uirevision=uirevision,
         legend=dict(orientation='v', x=1.01, y=1, tracegroupgap=2),
@@ -375,7 +417,7 @@ def get_product_groups(products):
     return dict(sorted(groups.items()))
 
 
-def build_group_figure(df_prices, normalize, downsample, x_range=None):
+def build_group_figure(df_prices, normalize, downsample, x_range=None, day_boundaries=None):
     products = sorted(df_prices['product'].unique().tolist())
     groups = get_product_groups(products)
     if not groups:
@@ -399,6 +441,13 @@ def build_group_figure(df_prices, normalize, downsample, x_range=None):
     for idx, gname in enumerate(group_names):
         row = idx // ncols + 1
         col = idx % ncols + 1
+
+        # Pivot all products in this group to get per-timestamp totals
+        group_df = df_prices[df_prices['product'].isin(groups[gname])].copy()
+        group_df['mid'] = (group_df['bid_price_1'] + group_df['ask_price_1']) / 2
+        pivot = group_df.pivot_table(index='timestamp', columns='product', values='mid', aggfunc='first')
+        total_mid = pivot.mean(axis=1).sort_index()
+
         for pidx, product in enumerate(groups[gname]):
             pdf = df_prices[df_prices['product'] == product]
             if downsample > 1:
@@ -422,8 +471,45 @@ def build_group_figure(df_prices, normalize, downsample, x_range=None):
                 hovertemplate=f'{product}<br>ts: %{{x}}<br>{y_label}: %{{y:.2f}}<extra></extra>',
             ), row=row, col=col)
 
+        # Total value line (sum of all mid prices in the group)
+        if downsample > 1:
+            total_mid = total_mid.iloc[::downsample]
+        if normalize:
+            first_total = total_mid.iloc[0] if not total_mid.empty else 0
+            total_y = (total_mid - first_total).values
+        else:
+            total_y = total_mid.values
+        fig.add_trace(go.Scattergl(
+            x=total_mid.index.values,
+            y=total_y,
+            mode='lines',
+            name='AVG',
+            legendgroup='avg',
+            legendgrouptitle_text='Group avg' if idx == 0 else None,
+            showlegend=(idx == 0),
+            line=dict(color='#111111', width=2.5, dash='dot'),
+            hovertemplate=f'AVG ({gname})<br>ts: %{{x}}<br>{y_label}: %{{y:.2f}}<extra></extra>',
+        ), row=row, col=col)
+
     if x_range is not None:
         fig.update_xaxes(range=x_range)
+
+    if day_boundaries:
+        tick_vals = [offset + 500_000 for offset, _ in day_boundaries]
+        tick_text = [f'Day {d}' for _, d in day_boundaries]
+        for offset, _ in day_boundaries:
+            if offset > 0:
+                for r in range(1, nrows + 1):
+                    for c in range(1, ncols + 1):
+                        fig.add_vline(
+                            x=offset, line_width=1.2,
+                            line_dash='dash', line_color='rgba(100,100,100,0.4)',
+                            row=r, col=c,
+                        )
+        fig.update_xaxes(
+            tickmode='array', tickvals=tick_vals, ticktext=tick_text,
+            tickfont=dict(size=10),
+        )
 
     fig.update_yaxes(title_text=y_label, title_font=dict(size=10))
     fig.update_layout(
@@ -495,6 +581,14 @@ app.layout = html.Div([
                 value=1, clearable=False, style={'width': '90px'},
             ),
         ]),
+        html.Div([
+            dcc.Checklist(
+                id='merge-days-toggle',
+                options=[{'label': ' Merge all days', 'value': 'merge'}],
+                value=[],
+                labelStyle={'fontSize': '12px', 'cursor': 'pointer'},
+            ),
+        ], style={'alignSelf': 'flex-end', 'paddingBottom': '4px'}),
     ], style={'display': 'flex', 'gap': '16px', 'alignItems': 'flex-end',
               'padding': '10px 20px 0 20px'}),
 
@@ -650,16 +744,27 @@ def update_days(round_num):
     Output('ob-qty-slider', 'max'),
     Output('ob-qty-slider', 'value'),
     Output('ob-qty-slider', 'marks'),
+    Output('frame-width-slider', 'max'),
+    Output('frame-width-slider', 'marks'),
     Output('frame-width-slider', 'value'),
     Output('start-slider', 'value'),
+    Output('day-dropdown', 'disabled'),
     Input('round-dropdown', 'value'),
     Input('day-dropdown', 'value'),
+    Input('merge-days-toggle', 'value'),
 )
-def update_controls(round_num, day):
-    if day is None:
-        raise PreventUpdate
+def update_controls(round_num, day, merge_val):
+    merged = bool(merge_val)
 
-    df_prices, df_trades = load_data(round_num, day)
+    if merged:
+        df_prices, df_trades, boundaries = load_merged_data(round_num)
+        ts_max = int(df_prices['timestamp'].max())
+    else:
+        if day is None:
+            raise PreventUpdate
+        df_prices, df_trades = load_data(round_num, day)
+        ts_max = int(df_prices['timestamp'].max())
+
     products = sorted(df_prices['product'].unique().tolist())
     traders = sorted(set(
         df_trades['buyer'].dropna().tolist() + df_trades['seller'].dropna().tolist()
@@ -671,13 +776,13 @@ def update_controls(round_num, day):
     ob_min = int(df_prices[VOL_COLS].min().min())
     ob_max = int(df_prices[VOL_COLS].max().max())
 
-    ts_max = int(df_prices['timestamp'].max())
-
     trader_style = {
         'display': 'flex', 'flexDirection': 'column',
         'padding': '0 20px 8px 20px',
         'visibility': 'visible' if traders else 'hidden',
     }
+
+    fw_marks = {1_000: '1k', ts_max: f'{ts_max // 1000}k'}
 
     return (
         [{'label': p, 'value': p} for p in products], products[0],
@@ -686,8 +791,9 @@ def update_controls(round_num, day):
         trader_style,
         qty_min, qty_max, [qty_min, qty_max], {qty_min: str(qty_min), qty_max: str(qty_max)},
         ob_min, ob_max, [ob_min, ob_max], {ob_min: str(ob_min), ob_max: str(ob_max)},
-        ts_max,
+        ts_max, fw_marks, ts_max,
         0,
+        merged,
     )
 
 
@@ -719,11 +825,17 @@ def handle_trader_shortcuts(all_clicks, none_clicks, solo, options):
     Input('frame-width-slider', 'value'),
     Input('round-dropdown', 'value'),
     Input('day-dropdown', 'value'),
+    Input('merge-days-toggle', 'value'),
 )
-def update_start_max(frame_width, round_num, day):
-    if day is None or frame_width is None:
+def update_start_max(frame_width, round_num, day, merge_val):
+    if frame_width is None:
         raise PreventUpdate
-    df_prices, _ = load_data(round_num, day)
+    if bool(merge_val):
+        df_prices, _, _b = load_merged_data(round_num)
+    else:
+        if day is None:
+            raise PreventUpdate
+        df_prices, _ = load_data(round_num, day)
     ts_max = int(df_prices['timestamp'].max())
     new_max = max(0, ts_max - frame_width)
     return new_max, {0: '0', new_max: str(new_max)}
@@ -743,13 +855,23 @@ def update_start_max(frame_width, round_num, day):
     Input('downsample-dropdown', 'value'),
     Input('frame-width-slider', 'value'),
     Input('start-slider', 'value'),
+    Input('merge-days-toggle', 'value'),
 )
 def update_graph(round_num, day, product, normalize, qty_range, ob_qty_range,
-                 visible_traders, trader_match, ob_display, downsample, frame_width, start):
-    if day is None or product is None:
+                 visible_traders, trader_match, ob_display, downsample,
+                 frame_width, start, merge_val):
+    if product is None:
         raise PreventUpdate
     try:
-        df_prices, df_trades = load_data(round_num, day)
+        if bool(merge_val):
+            df_prices, df_trades, boundaries = load_merged_data(round_num)
+            uirev = f'{round_num}-merged-{product}'
+        else:
+            if day is None:
+                raise PreventUpdate
+            df_prices, df_trades = load_data(round_num, day)
+            boundaries = None
+            uirev = f'{round_num}-{day}-{product}'
         if product not in df_prices['product'].values:
             raise PreventUpdate
         x_start = start or 0
@@ -760,8 +882,9 @@ def update_graph(round_num, day, product, normalize, qty_range, ob_qty_range,
             qty_range, ob_qty_range, visible_traders, trader_match or 'any',
             ob_display or 'bubbles',
             downsample or 1,
-            uirevision=f'{round_num}-{day}-{product}',
+            uirevision=uirev,
             x_range=[x_start, x_end],
+            day_boundaries=boundaries,
         )
     except (FileNotFoundError, KeyError):
         raise PreventUpdate
@@ -776,12 +899,19 @@ def update_graph(round_num, day, product, normalize, qty_range, ob_qty_range,
     Input('frame-width-slider', 'value'),
     Input('start-slider', 'value'),
     Input('view-tabs', 'value'),
+    Input('merge-days-toggle', 'value'),
 )
-def update_group_overview(round_num, day, normalize, downsample, frame_width, start, tab):
-    if tab != 'group' or day is None:
+def update_group_overview(round_num, day, normalize, downsample, frame_width, start, tab, merge_val):
+    if tab != 'group':
         raise PreventUpdate
     try:
-        df_prices, _ = load_data(round_num, day)
+        if bool(merge_val):
+            df_prices, _, boundaries = load_merged_data(round_num)
+        else:
+            if day is None:
+                raise PreventUpdate
+            df_prices, _ = load_data(round_num, day)
+            boundaries = None
         groups = get_product_groups(sorted(df_prices['product'].unique().tolist()))
         if not groups:
             return go.Figure(layout=go.Layout(
@@ -795,6 +925,7 @@ def update_group_overview(round_num, day, normalize, downsample, frame_width, st
             normalize == 'normalized',
             downsample or 1,
             x_range=[x_start, x_end],
+            day_boundaries=boundaries,
         )
     except (FileNotFoundError, KeyError):
         raise PreventUpdate
