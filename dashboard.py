@@ -142,7 +142,7 @@ def make_solo_options(traders):
 
 def build_figure(df_prices, df_trades, product, normalize, qty_range,
                  ob_qty_range, visible_traders, trader_match, ob_display,
-                 downsample, uirevision, x_range=None, day_boundaries=None):
+                 downsample, uirevision, show_mid=False, x_range=None, day_boundaries=None):
     prices = df_prices[df_prices['product'] == product]
     trades = df_trades[df_trades['symbol'] == product].copy().reset_index(drop=True)
 
@@ -251,6 +251,19 @@ def build_figure(df_prices, df_trades, product, normalize, qty_range,
                 line=dict(color=color, width=1.5),
                 hovertemplate=f'ts: %{{x}}<br>{y_label}: %{{y}}<extra></extra>',
             ), row=1, col=1)
+
+    # -- Mid price line --
+    if show_mid:
+        mid_line = (prices['bid_price_1'] + prices['ask_price_1']) / 2
+        mid_y = pd.Series(0.0, index=prices.index).values if normalize else mid_line.values
+        fig.add_trace(go.Scattergl(
+            x=prices['timestamp'].values,
+            y=mid_y,
+            mode='lines',
+            name='mid',
+            line=dict(color='rgba(90,90,90,0.85)', width=1.5, dash='dot'),
+            hovertemplate='ts: %{x}<br>mid: %{y:.2f}<extra></extra>',
+        ), row=1, col=1)
 
     # -- Trade markers (Scatter — fewer points, need triangle/square symbols) --
     if not trades_df.empty:
@@ -394,6 +407,13 @@ DOWNSAMPLE_OPTIONS = [
 
 GROUP_COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
 
+SERIES_STYLES = {
+    'mid': dict(dash='solid', width=1.5),
+    'bid': dict(dash='dash',  width=1.2),
+    'ask': dict(dash='dot',   width=1.2),
+}
+SERIES_LABELS = {'mid': 'mid', 'bid': 'best bid', 'ask': 'best ask'}
+
 
 def get_product_groups(products):
     """Return {group_name: [sorted products]} detected from a product list.
@@ -417,7 +437,18 @@ def get_product_groups(products):
     return dict(sorted(groups.items()))
 
 
-def build_group_figure(df_prices, normalize, downsample, x_range=None, day_boundaries=None):
+_DEFAULT_GROUPS = get_product_groups(_DEFAULT_PRODUCTS)
+_ISOLATE_OPTIONS = [{'label': '— all groups —', 'value': '__all__'}] + [
+    {'label': g, 'value': g} for g in _DEFAULT_GROUPS.keys()
+]
+
+
+def build_group_figure(df_prices, df_trades, normalize, downsample,
+                       show_trades=False, show_series=None,
+                       x_range=None, day_boundaries=None):
+    if not show_series:
+        show_series = ['mid']
+
     products = sorted(df_prices['product'].unique().tolist())
     groups = get_product_groups(products)
     if not groups:
@@ -436,51 +467,65 @@ def build_group_figure(df_prices, normalize, downsample, x_range=None, day_bound
         horizontal_spacing=0.08,
     )
 
-    y_label = 'mid − start' if normalize else 'mid price'
+    y_label = 'price − start' if normalize else 'price'
+
+    def get_s(pdf, s):
+        if s == 'bid':
+            return pdf['bid_price_1']
+        if s == 'ask':
+            return pdf['ask_price_1']
+        return (pdf['bid_price_1'] + pdf['ask_price_1']) / 2
 
     for idx, gname in enumerate(group_names):
         row = idx // ncols + 1
         col = idx % ncols + 1
 
-        # Pivot all products in this group to get per-timestamp totals
+        product_starts = {}
+        for product in groups[gname]:
+            pdf = df_prices[df_prices['product'] == product]
+            vals = get_s(pdf, 'mid').dropna()
+            product_starts[product] = vals.iloc[0] if not vals.empty else 0
+
+        # AVG uses first series
         group_df = df_prices[df_prices['product'].isin(groups[gname])].copy()
-        group_df['mid'] = (group_df['bid_price_1'] + group_df['ask_price_1']) / 2
-        pivot = group_df.pivot_table(index='timestamp', columns='product', values='mid', aggfunc='first')
-        total_mid = pivot.mean(axis=1).sort_index()
+        group_df['_s'] = get_s(group_df, show_series[0])
+        pivot = group_df.pivot_table(index='timestamp', columns='product', values='_s', aggfunc='first')
+        total_series = pivot.mean(axis=1).sort_index()
 
         for pidx, product in enumerate(groups[gname]):
             pdf = df_prices[df_prices['product'] == product]
             if downsample > 1:
                 pdf = pdf.iloc[::downsample]
-            mid = ((pdf['bid_price_1'] + pdf['ask_price_1']) / 2)
-            if normalize:
-                first_val = mid.iloc[0] if not mid.empty else 0
-                y = (mid - first_val).values
-            else:
-                y = mid.values
+            color = GROUP_COLORS[pidx % len(GROUP_COLORS)]
             short_name = product[len(gname) + 1:] if product.startswith(gname + '_') else product
-            fig.add_trace(go.Scattergl(
-                x=pdf['timestamp'].values,
-                y=y,
-                mode='lines',
-                name=short_name,
-                legendgroup=f'pos{pidx}',
-                legendgrouptitle_text=f'Variant {pidx + 1}' if idx == 0 else None,
-                showlegend=(idx == 0),
-                line=dict(color=GROUP_COLORS[pidx % len(GROUP_COLORS)], width=1.5),
-                hovertemplate=f'{product}<br>ts: %{{x}}<br>{y_label}: %{{y:.2f}}<extra></extra>',
-            ), row=row, col=col)
+            for s in show_series:
+                vals = get_s(pdf, s)
+                y = (vals - product_starts[product]).values if normalize else vals.values
+                suffix = f' ({SERIES_LABELS[s]})' if len(show_series) > 1 else ''
+                fig.add_trace(go.Scattergl(
+                    x=pdf['timestamp'].values,
+                    y=y,
+                    mode='lines',
+                    name=f'{short_name}{suffix}',
+                    legendgroup=f'pos{pidx}',
+                    legendgrouptitle_text=f'Variant {pidx + 1}' if idx == 0 else None,
+                    showlegend=(idx == 0),
+                    line=dict(color=color, **SERIES_STYLES[s]),
+                    hovertemplate=(
+                        f'{product} {SERIES_LABELS[s]}<br>'
+                        f'ts: %{{x}}<br>{y_label}: %{{y:.2f}}<extra></extra>'
+                    ),
+                ), row=row, col=col)
 
-        # Total value line (sum of all mid prices in the group)
         if downsample > 1:
-            total_mid = total_mid.iloc[::downsample]
+            total_series = total_series.iloc[::downsample]
         if normalize:
-            first_total = total_mid.iloc[0] if not total_mid.empty else 0
-            total_y = (total_mid - first_total).values
+            first_total = total_series.iloc[0] if not total_series.empty else 0
+            total_y = (total_series - first_total).values
         else:
-            total_y = total_mid.values
+            total_y = total_series.values
         fig.add_trace(go.Scattergl(
-            x=total_mid.index.values,
+            x=total_series.index.values,
             y=total_y,
             mode='lines',
             name='AVG',
@@ -490,6 +535,40 @@ def build_group_figure(df_prices, normalize, downsample, x_range=None, day_bound
             line=dict(color='#111111', width=2.5, dash='dot'),
             hovertemplate=f'AVG ({gname})<br>ts: %{{x}}<br>{y_label}: %{{y:.2f}}<extra></extra>',
         ), row=row, col=col)
+
+        if show_trades and df_trades is not None and not df_trades.empty:
+            group_trades = df_trades[df_trades['symbol'].isin(groups[gname])]
+            for pidx, product in enumerate(groups[gname]):
+                pt = group_trades[group_trades['symbol'] == product]
+                if pt.empty:
+                    continue
+                color = GROUP_COLORS[pidx % len(GROUP_COLORS)]
+                trade_price = pt['price'].values.astype(float)
+                if normalize:
+                    trade_price = trade_price - product_starts[product]
+                short_name = product[len(gname) + 1:] if product.startswith(gname + '_') else product
+                fig.add_trace(go.Scatter(
+                    x=pt['timestamp'].values,
+                    y=trade_price,
+                    mode='markers',
+                    name=f'{short_name} trades',
+                    legendgroup=f'trades{pidx}',
+                    legendgrouptitle_text='Trades' if idx == 0 and pidx == 0 else None,
+                    showlegend=(idx == 0),
+                    marker=dict(
+                        symbol='circle',
+                        color=color,
+                        opacity=0.7,
+                        size=5,
+                        line=dict(width=1, color='rgba(0,0,0,0.4)'),
+                    ),
+                    customdata=pt[['quantity', 'timestamp']].values,
+                    hovertemplate=(
+                        f'{product}<br>ts: %{{customdata[1]}}<br>'
+                        f'{y_label}: %{{y:.2f}}<br>'
+                        'qty: %{customdata[0]}<extra></extra>'
+                    ),
+                ), row=row, col=col)
 
     if x_range is not None:
         fig.update_xaxes(range=x_range)
@@ -519,6 +598,108 @@ def build_group_figure(df_prices, normalize, downsample, x_range=None, day_bound
         uirevision='group-overview',
     )
     return fig
+
+def build_isolated_figure(df_prices, df_trades, group_name, products, normalize,
+                          downsample, show_series, show_trades=False,
+                          x_range=None, day_boundaries=None):
+    if not show_series:
+        show_series = ['mid']
+
+    fig = go.Figure()
+    y_label = 'price − start' if normalize else 'price'
+
+    def get_series_vals(pdf, s):
+        if s == 'bid':
+            return pdf['bid_price_1']
+        if s == 'ask':
+            return pdf['ask_price_1']
+        return (pdf['bid_price_1'] + pdf['ask_price_1']) / 2
+
+    product_starts = {}
+    for product in products:
+        pdf = df_prices[df_prices['product'] == product]
+        vals = get_series_vals(pdf, 'mid').dropna()
+        product_starts[product] = vals.iloc[0] if not vals.empty else 0
+
+    for pidx, product in enumerate(products):
+        pdf = df_prices[df_prices['product'] == product]
+        if downsample > 1:
+            pdf = pdf.iloc[::downsample]
+        color = GROUP_COLORS[pidx % len(GROUP_COLORS)]
+        short_name = product[len(group_name) + 1:] if product.startswith(group_name + '_') else product
+
+        for sidx, s in enumerate(show_series):
+            vals = get_series_vals(pdf, s)
+            y = (vals - product_starts[product]).values if normalize else vals.values
+            fig.add_trace(go.Scattergl(
+                x=pdf['timestamp'].values,
+                y=y,
+                mode='lines',
+                name=f'{short_name} ({SERIES_LABELS[s]})',
+                legendgroup=short_name,
+                legendgrouptitle_text=short_name if sidx == 0 else None,
+                line=dict(color=color, **SERIES_STYLES[s]),
+                hovertemplate=(
+                    f'{product} {SERIES_LABELS[s]}<br>'
+                    'ts: %{x}<br>'
+                    f'{y_label}: %{{y:.2f}}<extra></extra>'
+                ),
+            ))
+
+        if show_trades and df_trades is not None and not df_trades.empty:
+            pt = df_trades[df_trades['symbol'] == product]
+            if not pt.empty:
+                trade_price = pt['price'].values.astype(float)
+                if normalize:
+                    trade_price = trade_price - product_starts[product]
+                fig.add_trace(go.Scatter(
+                    x=pt['timestamp'].values,
+                    y=trade_price,
+                    mode='markers',
+                    name=f'{short_name} trades',
+                    legendgroup=short_name,
+                    marker=dict(
+                        symbol='circle',
+                        color=color,
+                        opacity=0.7,
+                        size=5,
+                        line=dict(width=1, color='rgba(0,0,0,0.4)'),
+                    ),
+                    customdata=pt[['quantity', 'timestamp']].values,
+                    hovertemplate=(
+                        f'{product}<br>ts: %{{customdata[1]}}<br>'
+                        f'{y_label}: %{{y:.2f}}<br>'
+                        'qty: %{customdata[0]}<extra></extra>'
+                    ),
+                ))
+
+    if x_range is not None:
+        fig.update_xaxes(range=x_range)
+
+    if day_boundaries:
+        tick_vals = [offset + 500_000 for offset, _ in day_boundaries]
+        tick_text = [f'Day {d}' for _, d in day_boundaries]
+        for offset, _ in day_boundaries:
+            if offset > 0:
+                fig.add_vline(
+                    x=offset, line_width=1.5,
+                    line_dash='dash', line_color='rgba(100,100,100,0.5)',
+                )
+        fig.update_xaxes(
+            tickmode='array', tickvals=tick_vals, ticktext=tick_text,
+            tickfont=dict(size=11),
+        )
+
+    fig.update_yaxes(title_text=y_label)
+    fig.update_layout(
+        height=680,
+        title=dict(text=group_name, font=dict(size=14)),
+        legend=dict(orientation='v', x=1.01, y=1, tracegroupgap=4),
+        margin=dict(r=160, t=50, b=40),
+        uirevision=f'isolated-{group_name}',
+    )
+    return fig
+
 
 app = Dash(__name__)
 
@@ -573,6 +754,16 @@ app.layout = html.Div([
                 value='bubbles', inline=True,
             ),
         ], style={'alignSelf': 'flex-end', 'paddingBottom': '2px'}),
+        html.Div([
+            html.Label('Show', style={'fontSize': '12px'}),
+            dcc.Checklist(
+                id='mid-price-toggle',
+                options=[{'label': ' Mid price', 'value': 'mid'}],
+                value=[],
+                inline=True,
+                labelStyle={'fontSize': '12px', 'cursor': 'pointer'},
+            ),
+        ], style={'alignSelf': 'flex-end', 'paddingBottom': '4px'}),
         html.Div([
             html.Label('Downsample', style={'fontSize': '12px'}),
             dcc.Dropdown(
@@ -704,10 +895,46 @@ app.layout = html.Div([
             ),
         ]),
         dcc.Tab(label='Group Overview', value='group', children=[
+            html.Div([
+                html.Label('Series:', style={
+                    'fontSize': '12px', 'marginRight': '6px', 'alignSelf': 'center',
+                }),
+                dcc.Checklist(
+                    id='group-series-checklist',
+                    options=[
+                        {'label': ' Mid',      'value': 'mid'},
+                        {'label': ' Best bid', 'value': 'bid'},
+                        {'label': ' Best ask', 'value': 'ask'},
+                    ],
+                    value=['mid'],
+                    inline=True,
+                    labelStyle={'marginRight': '10px', 'fontSize': '12px', 'cursor': 'pointer'},
+                ),
+                html.Span('│', style={'margin': '0 12px', 'color': '#ccc', 'alignSelf': 'center'}),
+                dcc.Checklist(
+                    id='group-trades-toggle',
+                    options=[{'label': ' Show trades', 'value': 'trades'}],
+                    value=[],
+                    inline=True,
+                    labelStyle={'fontSize': '12px', 'cursor': 'pointer'},
+                ),
+                html.Span('│', style={'margin': '0 12px', 'color': '#ccc', 'alignSelf': 'center'}),
+                html.Label('Isolate:', style={
+                    'fontSize': '12px', 'marginRight': '6px', 'alignSelf': 'center',
+                }),
+                dcc.Dropdown(
+                    id='isolate-group-dropdown',
+                    options=_ISOLATE_OPTIONS,
+                    value='__all__',
+                    clearable=False,
+                    style={'width': '200px', 'fontSize': '12px'},
+                ),
+            ], style={'display': 'flex', 'alignItems': 'center', 'padding': '8px 20px 4px 20px',
+                      'flexWrap': 'wrap', 'gap': '4px'}),
             dcc.Loading(
                 id='group-loading',
                 type='circle',
-                children=dcc.Graph(id='group-overview-graph', style={'minHeight': '160vh'}),
+                children=dcc.Graph(id='group-overview-graph', style={'minHeight': '80vh'}),
             ),
         ]),
     ]),
@@ -856,10 +1083,11 @@ def update_start_max(frame_width, round_num, day, merge_val):
     Input('frame-width-slider', 'value'),
     Input('start-slider', 'value'),
     Input('merge-days-toggle', 'value'),
+    Input('mid-price-toggle', 'value'),
 )
 def update_graph(round_num, day, product, normalize, qty_range, ob_qty_range,
                  visible_traders, trader_match, ob_display, downsample,
-                 frame_width, start, merge_val):
+                 frame_width, start, merge_val, mid_price_val):
     if product is None:
         raise PreventUpdate
     try:
@@ -883,9 +1111,32 @@ def update_graph(round_num, day, product, normalize, qty_range, ob_qty_range,
             ob_display or 'bubbles',
             downsample or 1,
             uirevision=uirev,
+            show_mid=bool(mid_price_val),
             x_range=[x_start, x_end],
             day_boundaries=boundaries,
         )
+    except (FileNotFoundError, KeyError):
+        raise PreventUpdate
+
+
+@app.callback(
+    Output('isolate-group-dropdown', 'options'),
+    Input('round-dropdown', 'value'),
+    Input('day-dropdown', 'value'),
+    Input('merge-days-toggle', 'value'),
+)
+def update_isolate_options(round_num, day, merge_val):
+    try:
+        if bool(merge_val):
+            df_prices, _, _ = load_merged_data(round_num)
+        else:
+            if day is None:
+                raise PreventUpdate
+            df_prices, _ = load_data(round_num, day)
+        groups = get_product_groups(sorted(df_prices['product'].unique().tolist()))
+        return [{'label': '— all groups —', 'value': '__all__'}] + [
+            {'label': g, 'value': g} for g in groups.keys()
+        ]
     except (FileNotFoundError, KeyError):
         raise PreventUpdate
 
@@ -900,30 +1151,52 @@ def update_graph(round_num, day, product, normalize, qty_range, ob_qty_range,
     Input('start-slider', 'value'),
     Input('view-tabs', 'value'),
     Input('merge-days-toggle', 'value'),
+    Input('group-series-checklist', 'value'),
+    Input('group-trades-toggle', 'value'),
+    Input('isolate-group-dropdown', 'value'),
 )
-def update_group_overview(round_num, day, normalize, downsample, frame_width, start, tab, merge_val):
+def update_group_overview(round_num, day, normalize, downsample, frame_width, start,
+                          tab, merge_val, group_series, group_trades_val, isolate):
     if tab != 'group':
         raise PreventUpdate
     try:
         if bool(merge_val):
-            df_prices, _, boundaries = load_merged_data(round_num)
+            df_prices, df_trades, boundaries = load_merged_data(round_num)
         else:
             if day is None:
                 raise PreventUpdate
-            df_prices, _ = load_data(round_num, day)
+            df_prices, df_trades = load_data(round_num, day)
             boundaries = None
+        show_series = group_series or ['mid']
+        show_trades = bool(group_trades_val)
+        norm = normalize == 'normalized'
+        ds = downsample or 1
+        x_start = start or 0
+        x_end = x_start + (frame_width or 999_900)
+
+        if isolate and isolate != '__all__':
+            groups = get_product_groups(sorted(df_prices['product'].unique().tolist()))
+            if isolate not in groups:
+                raise PreventUpdate
+            return build_isolated_figure(
+                df_prices, df_trades,
+                isolate, groups[isolate],
+                norm, ds, show_series,
+                show_trades=show_trades,
+                x_range=[x_start, x_end],
+                day_boundaries=boundaries,
+            )
+
         groups = get_product_groups(sorted(df_prices['product'].unique().tolist()))
         if not groups:
             return go.Figure(layout=go.Layout(
                 title='No product groups detected for this round/day.',
                 height=400,
             ))
-        x_start = start or 0
-        x_end = x_start + (frame_width or 999_900)
         return build_group_figure(
-            df_prices,
-            normalize == 'normalized',
-            downsample or 1,
+            df_prices, df_trades, norm, ds,
+            show_trades=show_trades,
+            show_series=show_series,
             x_range=[x_start, x_end],
             day_boundaries=boundaries,
         )
